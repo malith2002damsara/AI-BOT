@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+langchain==0.3.24
+langchain-community
+langchain-groq
+langgraph
+langchain_chroma
+pypdf
+langchain-jina
+wikipedia
+langchain-text-splitters
+pydantic
