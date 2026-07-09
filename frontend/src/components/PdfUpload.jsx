@@ -5,6 +5,7 @@ function PdfUpload({ onUploadSuccess }) {
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState("");
   const [status, setStatus] = useState("");
+  const [statusType, setStatusType] = useState("");
 
   const fileInputRef = useRef(null);
 
@@ -14,31 +15,35 @@ function PdfUpload({ onUploadSuccess }) {
     if (!file) return;
 
     if (file.type !== "application/pdf") {
+      setStatusType("error");
       setStatus("❌ Please select a PDF file.");
       return;
     }
 
     setFileName(file.name);
     setUploading(true);
+    setStatusType("info");
     setStatus("⏳ Uploading PDF...");
 
     try {
       const res = await uploadPdf(file);
-
       console.log("Upload Response:", res);
 
+      setStatusType("success");
       setStatus("✅ PDF uploaded successfully.");
 
       if (onUploadSuccess) {
         onUploadSuccess(res);
       }
     } catch (error) {
-      console.error(error);
+      console.error("Upload error:", error);
 
-      if (error.response) {
+      setStatusType("error");
+      
+      if (error.message.includes("Failed to fetch") || error.message.includes("connect")) {
+        setStatus("❌ Cannot connect to backend server. Make sure the backend is running on port 8000.");
+      } else if (error.response) {
         setStatus(`❌ Server Error (${error.response.status})`);
-      } else if (error.request) {
-        setStatus("❌ Cannot connect to backend server.");
       } else {
         setStatus(`❌ ${error.message}`);
       }
@@ -66,8 +71,12 @@ function PdfUpload({ onUploadSuccess }) {
         />
       </label>
 
-      {fileName && <p>{fileName}</p>}
-      {status && <p>{status}</p>}
+      {fileName && <p className="file-name">{fileName}</p>}
+      {status && (
+        <p className={`status-msg ${statusType}`}>
+          {status}
+        </p>
+      )}
     </div>
   );
 }

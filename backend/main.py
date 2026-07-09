@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import (
@@ -18,14 +19,12 @@ from langchain_core.messages import (
     ToolMessage,
     AIMessage,
 )
-from langchain_core.tools import tool, BaseTool
+from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import JinaEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_community.tools import WikipediaQueryRun
-from langchain_community.utilities import WikipediaAPIWrapper
 import requests
 
 # ---------- Setup logging ----------
@@ -225,15 +224,14 @@ tools_dict = {t.name: t for t in tools}
 # ---------- 3. LangGraph Agent ----------
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    language: str  # Add language preference to state
 
 system_prompt = """
-You are an intelligent AI assistant who answers questions in Sinhala about the uploaded PDF document.
+You are an intelligent AI assistant who answers questions about the uploaded PDF document.
 
 Available tools:
 1. retriever_tool - Use this to search the uploaded PDF document
 2. wikipedia_search - Use this to search Wikipedia for general knowledge
-
-Always respond in Sinhala language.
 
 When using tools:
 - For retriever_tool: pass the search query as 'query' parameter
@@ -270,12 +268,21 @@ def call_llm(state: AgentState) -> AgentState:
     # Invoke LLM
     response = llm_with_tools.invoke(messages)
     
-    # Ensure response is in Sinhala
-    if hasattr(response, 'content') and response.content:
-        if not any('\u0D80' <= char <= '\u0DFF' for char in response.content):
-            response.content = translate_to_sinhala(response.content)
+    # Get language preference from state
+    language = state.get("language", "sinhala")
     
-    return {"messages": [response]}
+    # Translate response based on language preference
+    if hasattr(response, 'content') and response.content:
+        if language.lower() == "sinhala":
+            # If content is in English, translate to Sinhala
+            if not any('\u0D80' <= char <= '\u0DFF' for char in response.content):
+                response.content = translate_to_sinhala(response.content)
+        else:  # English
+            # If content is in Sinhala, translate to English
+            if any('\u0D80' <= char <= '\u0DFF' for char in response.content):
+                response.content = translate_to_english(response.content)
+    
+    return {"messages": [response], "language": language}
 
 def take_action(state: AgentState) -> AgentState:
     """Execute tool calls"""
@@ -352,15 +359,10 @@ app_graph = workflow.compile()
 # ---------- 4. FastAPI App ----------
 app = FastAPI(title="RAG Agent API - Sinhala")
 
-origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    FRONTEND_URL,
-]
-
+# Configure CORS with more permissive settings for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -368,6 +370,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    language: str = "sinhala"  # Default to Sinhala
 
 class ChatResponse(BaseModel):
     reply: str
@@ -380,41 +383,60 @@ def health_check():
         "pdf_loaded": retriever is not None
     }
 
+@app.get("/test")
+def test_endpoint():
+    return {"message": "Backend is working!"}
+
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="PDF file එකක් පමණක් upload කළ හැකියි")
-
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
     try:
-        build_vectorstore(file_path)
-    except Exception as e:
-        logger.error(f"PDF processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"PDF සැකසීමේ දෝෂයක්: {str(e)}")
+        if file.content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="PDF file එකක් පමණක් upload කළ හැකියි")
 
-    return {"status": "ok", "filename": file.filename, "message": "PDF එක සාර්ථකව සැකසුණා"}
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        try:
+            build_vectorstore(file_path)
+        except Exception as e:
+            logger.error(f"PDF processing error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"PDF සැකසීමේ දෝෂයක්: {str(e)}")
+
+        return {"status": "ok", "filename": file.filename, "message": "PDF එක සාර්ථකව සැකසුණා"}
+    except Exception as e:
+        logger.error(f"Upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
-        # Invoke the graph
-        result = app_graph.invoke({"messages": [HumanMessage(content=req.message)]})
+        # Invoke the graph with language preference
+        result = app_graph.invoke({
+            "messages": [HumanMessage(content=req.message)],
+            "language": req.language
+        })
         
         # Extract the final response
         if result["messages"] and len(result["messages"]) > 0:
             last_message = result["messages"][-1]
             reply = last_message.content if hasattr(last_message, 'content') else str(last_message)
             
-            # Ensure final response is in Sinhala
-            if not any('\u0D80' <= char <= '\u0DFF' for char in reply):
-                reply = translate_to_sinhala(reply)
+            # Ensure response matches language preference
+            if req.language.lower() == "sinhala":
+                if not any('\u0D80' <= char <= '\u0DFF' for char in reply):
+                    reply = translate_to_sinhala(reply)
+            else:  # English
+                if any('\u0D80' <= char <= '\u0DFF' for char in reply):
+                    reply = translate_to_english(reply)
         else:
-            reply = "පිළිතුරක් ජනනය කළ නොහැකි වුණා."
+            reply = "පිළිතුරක් ජනනය කළ නොහැකි වුණා." if req.language.lower() == "sinhala" else "Unable to generate response."
         
         return {"reply": reply}
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
-        return {"reply": f"ඔබගේ ඉල්ලීම සැකසීමේ දෝෂයක්: {str(e)}"}
+        error_msg = f"ඔබගේ ඉල්ලීම සැකසීමේ දෝෂයක්: {str(e)}" if req.language.lower() == "sinhala" else f"Error processing your request: {str(e)}"
+        return {"reply": error_msg}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
