@@ -1,54 +1,75 @@
-import { useState, useRef } from 'react'
-import { uploadPdf } from '../api'
+import { useState, useRef } from "react";
+import { uploadPdf } from "../api";
 
 function PdfUpload({ onUploadSuccess }) {
-  const [uploading, setUploading] = useState(false)
-  const [fileName, setFileName] = useState('')
-  const [status, setStatus] = useState('')
-  const fileInputRef = useRef(null)
+  const [uploading, setUploading] = useState(false);
+  const [fileName, setFileName] = useState("");
+  const [status, setStatus] = useState("");
+
+  const fileInputRef = useRef(null);
 
   const handleFileChange = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
+    const file = e.target.files?.[0];
 
-    if (file.type !== 'application/pdf') {
-      setStatus('❌ PDF file එකක් විතරක් upload කරන්න')
-      return
+    if (!file) return;
+
+    if (file.type !== "application/pdf") {
+      setStatus("❌ Please select a PDF file.");
+      return;
     }
 
-    setFileName(file.name)
-    setUploading(true)
-    setStatus('⏳ Uploading & processing...')
+    setFileName(file.name);
+    setUploading(true);
+    setStatus("⏳ Uploading PDF...");
 
     try {
-      await uploadPdf(file)
-      setStatus('✅ PDF එක සාර්ථකව process කරා. දැන් chat කරන්න පුළුවන්!')
-      onUploadSuccess()
-    } catch (err) {
-      setStatus('❌ Upload එක fail උනා: ' + err.message)
+      const res = await uploadPdf(file);
+
+      console.log("Upload Response:", res);
+
+      setStatus("✅ PDF uploaded successfully.");
+
+      if (onUploadSuccess) {
+        onUploadSuccess(res);
+      }
+    } catch (error) {
+      console.error(error);
+
+      if (error.response) {
+        setStatus(`❌ Server Error (${error.response.status})`);
+      } else if (error.request) {
+        setStatus("❌ Cannot connect to backend server.");
+      } else {
+        setStatus(`❌ ${error.message}`);
+      }
     } finally {
-      setUploading(false)
-      if (fileInputRef.current) fileInputRef.current.value = ''
+      setUploading(false);
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
     }
-  }
+  };
 
   return (
     <div className="pdf-upload">
-      <label className={`upload-btn ${uploading ? 'disabled' : ''}`}>
-        {uploading ? 'Processing...' : '📄 PDF එකක් Upload කරන්න'}
+      <label className={`upload-btn ${uploading ? "disabled" : ""}`}>
+        {uploading ? "Processing..." : "📄 Upload PDF"}
+
         <input
-          type="file"
-          accept="application/pdf"
-          onChange={handleFileChange}
-          disabled={uploading}
           ref={fileInputRef}
+          type="file"
+          accept=".pdf"
           hidden
+          disabled={uploading}
+          onChange={handleFileChange}
         />
       </label>
-      {fileName && <p className="file-name">{fileName}</p>}
-      {status && <p className="status-msg">{status}</p>}
+
+      {fileName && <p>{fileName}</p>}
+      {status && <p>{status}</p>}
     </div>
-  )
+  );
 }
 
-export default PdfUpload
+export default PdfUpload;
