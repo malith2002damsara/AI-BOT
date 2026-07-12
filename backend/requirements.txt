@@ -6,10 +6,7 @@ langchain-core
 langchain-groq
 langchain-community
 langchain-chroma
-chromadb
-jina-embeddings
-PyPDF2
 pypdf
-wikipedia
 requests
-deep-translator
+wikipedia
+cloudinary

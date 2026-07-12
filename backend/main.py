@@ -4,6 +4,7 @@ from typing import TypedDict, Annotated, Sequence, List, Dict, Any
 from operator import add as add_messages
 import logging
 import json
+from datetime import datetime
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -21,11 +22,14 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
-from langchain_community.embeddings import JinaEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 import requests
+import cloudinary
+import cloudinary.uploader
+from cloudinary.utils import cloudinary_url
 
 # ---------- Setup logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +44,30 @@ LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "jina-embeddings-v3")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
+# Cloudinary Configuration
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+
+# Configure Cloudinary
+if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True
+    )
+    logger.info("Cloudinary configured successfully")
+else:
+    logger.warning("Cloudinary credentials not found. PDF upload will work without cloud storage.")
+
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Store uploaded PDFs info
+uploaded_pdfs = []
+current_pdf = None
+retriever = None
 
 # ---------- Google Translate using requests ----------
 def translate_to_sinhala(text: str) -> str:
@@ -117,38 +143,81 @@ llm = ChatGroq(
     api_key=GROQ_API_KEY,
 )
 
-embeddings = JinaEmbeddings(
-    model=EMBEDDING_MODEL,
-    jina_api_key=JINA_API_KEY,
-)
-
-# ---------- 2. Vectorstore / Retriever ----------
-retriever = None
-
-def build_vectorstore(pdf_path: str):
-    """PDF එකෙන් vectorstore එක build කරනවා"""
-    global retriever
-
-    pdf_loader = PyPDFLoader(pdf_path)
-    pages = pdf_loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    pages_split = text_splitter.split_documents(pages)
-
-    vectorstore = Chroma.from_documents(
-        documents=pages_split,
-        embedding=embeddings,
-        collection_name="data",
+# Use HuggingFace embeddings as fallback if Jina is not available
+try:
+    from langchain_community.embeddings import JinaEmbeddings
+    if JINA_API_KEY:
+        embeddings = JinaEmbeddings(
+            model=EMBEDDING_MODEL,
+            jina_api_key=JINA_API_KEY,
+        )
+        logger.info("Using Jina embeddings")
+    else:
+        raise Exception("JINA_API_KEY not found")
+except Exception as e:
+    logger.warning(f"Jina embeddings not available: {str(e)}. Using HuggingFace embeddings.")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': False}
     )
 
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+# ---------- 2. Vectorstore / Retriever ----------
+def build_vectorstore(pdf_path: str):
+    """Build vectorstore from PDF"""
+    global retriever, current_pdf
 
-# Default PDF එක load කරනවා
+    try:
+        pdf_loader = PyPDFLoader(pdf_path)
+        pages = pdf_loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        pages_split = text_splitter.split_documents(pages)
+
+        vectorstore = Chroma.from_documents(
+            documents=pages_split,
+            embedding=embeddings,
+            collection_name="data",
+        )
+
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+        current_pdf = pdf_path
+        logger.info(f"Vectorstore built successfully from: {pdf_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error building vectorstore: {str(e)}")
+        raise e
+
+def load_pdf_from_cloudinary(public_id: str, file_path: str) -> bool:
+    """Load PDF from Cloudinary"""
+    try:
+        # Get the download URL
+        url, options = cloudinary_url(public_id, resource_type="raw", format="pdf")
+        
+        # Download the PDF
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            logger.info(f"PDF downloaded from Cloudinary: {public_id}")
+            return True
+        else:
+            logger.error(f"Failed to download PDF from Cloudinary: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Error loading PDF from Cloudinary: {str(e)}")
+        return False
+
+# Load default PDF if exists
 _default_pdf = os.path.join(os.path.dirname(__file__), "codeprolk.pdf")
 if os.path.exists(_default_pdf):
-    build_vectorstore(_default_pdf)
+    try:
+        build_vectorstore(_default_pdf)
+        logger.info("Default PDF loaded successfully")
+    except Exception as e:
+        logger.error(f"Error loading default PDF: {str(e)}")
 
-# ---------- Define Tools with proper names ----------
+# ---------- Define Tools ----------
 @tool
 def retriever_tool(query: str) -> str:
     """Use this tool to search and retrieve information from the uploaded PDF document. Input should be a search query string."""
@@ -224,7 +293,7 @@ tools_dict = {t.name: t for t in tools}
 # ---------- 3. LangGraph Agent ----------
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    language: str  # Add language preference to state
+    language: str
 
 system_prompt = """
 You are an intelligent AI assistant who answers questions about the uploaded PDF document.
@@ -248,11 +317,9 @@ def should_continue(state: AgentState):
     messages = state["messages"]
     last_message = messages[-1]
     
-    # Check if the last message has tool calls
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         return True
     
-    # For AIMessage, check if it has tool_calls attribute
     if isinstance(last_message, AIMessage) and hasattr(last_message, 'tool_calls'):
         return len(last_message.tool_calls) > 0
     
@@ -262,23 +329,16 @@ def call_llm(state: AgentState) -> AgentState:
     """Call the LLM with tools"""
     messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
     
-    # Bind tools to LLM
     llm_with_tools = llm.bind_tools(tools)
-    
-    # Invoke LLM
     response = llm_with_tools.invoke(messages)
     
-    # Get language preference from state
     language = state.get("language", "sinhala")
     
-    # Translate response based on language preference
     if hasattr(response, 'content') and response.content:
         if language.lower() == "sinhala":
-            # If content is in English, translate to Sinhala
             if not any('\u0D80' <= char <= '\u0DFF' for char in response.content):
                 response.content = translate_to_sinhala(response.content)
-        else:  # English
-            # If content is in Sinhala, translate to English
+        else:
             if any('\u0D80' <= char <= '\u0DFF' for char in response.content):
                 response.content = translate_to_english(response.content)
     
@@ -306,16 +366,13 @@ def take_action(state: AgentState) -> AgentState:
             result = f"වැරදි මෙවලම් නමක්: {tool_name}"
         else:
             try:
-                # Get the tool and invoke it
                 tool_obj = tools_dict[tool_name]
                 
-                # Extract query from args
                 if "query" in tool_args:
                     query = tool_args["query"]
                 elif "input" in tool_args:
                     query = tool_args["input"]
                 else:
-                    # Use the first argument
                     args_list = list(tool_args.values())
                     if args_list:
                         query = args_list[0]
@@ -328,14 +385,12 @@ def take_action(state: AgentState) -> AgentState:
                         ))
                         continue
                 
-                # Invoke the tool
                 result = tool_obj.invoke(query)
                 
             except Exception as e:
                 logger.error(f"Error in take_action for tool {tool_name}: {str(e)}")
                 result = f"මෙවලම ක්‍රියාත්මක කිරීමේ දෝෂය: {str(e)}"
         
-        # Create ToolMessage
         tool_message = ToolMessage(
             tool_call_id=tool_id,
             name=tool_name,
@@ -359,7 +414,6 @@ app_graph = workflow.compile()
 # ---------- 4. FastAPI App ----------
 app = FastAPI(title="RAG Agent API - Sinhala")
 
-# Configure CORS with more permissive settings for development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173", "*"],
@@ -370,7 +424,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    language: str = "sinhala"  # Default to Sinhala
+    language: str = "sinhala"
 
 class ChatResponse(BaseModel):
     reply: str
@@ -380,59 +434,192 @@ def health_check():
     return {
         "status": "ok", 
         "message": "RAG Agent API is running - Sinhala Support",
-        "pdf_loaded": retriever is not None
+        "pdf_loaded": retriever is not None,
+        "pdfs_count": len(uploaded_pdfs)
     }
 
-@app.get("/test")
-def test_endpoint():
-    return {"message": "Backend is working!"}
+@app.get("/pdfs")
+def get_pdfs():
+    return {"pdfs": uploaded_pdfs}
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    global uploaded_pdfs
+    
     try:
         if file.content_type != "application/pdf":
             raise HTTPException(status_code=400, detail="PDF file එකක් පමණක් upload කළ හැකියි")
 
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_path, "wb") as buffer:
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = f"{timestamp}_{file.filename}"
+        local_path = os.path.join(UPLOAD_DIR, safe_filename)
+        
+        # Save locally first
+        with open(local_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        # Build vectorstore
         try:
-            build_vectorstore(file_path)
+            build_vectorstore(local_path)
         except Exception as e:
-            logger.error(f"PDF processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"PDF සැකසීමේ දෝෂයක්: {str(e)}")
+            logger.error(f"Vectorstore build error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
-        return {"status": "ok", "filename": file.filename, "message": "PDF එක සාර්ථකව සැකසුණා"}
+        # Upload to Cloudinary if configured
+        cloudinary_url_result = None
+        public_id = None
+        
+        if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+            try:
+                upload_result = cloudinary.uploader.upload(
+                    local_path,
+                    resource_type="raw",
+                    folder="pdfs",
+                    public_id=f"pdf_{timestamp}_{file.filename.replace('.pdf', '')}"
+                )
+                
+                cloudinary_url_result = cloudinary_url(upload_result['public_id'], resource_type="raw", format="pdf")[0]
+                public_id = upload_result['public_id']
+                logger.info(f"PDF uploaded to Cloudinary: {public_id}")
+                
+            except Exception as e:
+                logger.error(f"Cloudinary upload error: {str(e)}")
+                # Still continue even if Cloudinary fails
+        
+        # Store PDF info
+        pdf_info = {
+            "id": public_id or f"local_{timestamp}",
+            "name": file.filename,
+            "cloudinary_url": cloudinary_url_result,
+            "public_id": public_id,
+            "uploaded_at": datetime.now().isoformat(),
+            "local_path": local_path
+        }
+        uploaded_pdfs.append(pdf_info)
+
+        return {
+            "status": "ok", 
+            "filename": file.filename, 
+            "message": "PDF එක සාර්ථකව සැකසුණා",
+            "pdf_info": pdf_info
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
+@app.post("/load-pdf/{public_id}")
+def load_pdf(public_id: str):
+    """Load a previously uploaded PDF from Cloudinary or local storage"""
+    try:
+        # Find PDF info
+        pdf_info = next((p for p in uploaded_pdfs if p["public_id"] == public_id), None)
+        if not pdf_info:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        
+        # Check if local file exists
+        if "local_path" in pdf_info and os.path.exists(pdf_info["local_path"]):
+            try:
+                build_vectorstore(pdf_info["local_path"])
+                return {"status": "ok", "message": "PDF loaded successfully from local cache"}
+            except Exception as e:
+                logger.error(f"Error loading from local cache: {str(e)}")
+                # If local loading fails, try downloading again
+        
+        # If public_id exists and Cloudinary is configured, download from Cloudinary
+        if public_id and CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+            try:
+                local_path = os.path.join(UPLOAD_DIR, f"loaded_{public_id}.pdf")
+                
+                if load_pdf_from_cloudinary(public_id, local_path):
+                    build_vectorstore(local_path)
+                    # Update local_path in pdf_info
+                    pdf_info["local_path"] = local_path
+                    return {"status": "ok", "message": "PDF loaded successfully from Cloudinary"}
+                else:
+                    raise Exception("Failed to download PDF from Cloudinary")
+                    
+            except Exception as e:
+                logger.error(f"Cloudinary download error: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to download PDF: {str(e)}")
+        else:
+            raise HTTPException(status_code=404, detail="PDF file not found locally and Cloudinary not configured")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Load PDF error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error loading PDF: {str(e)}")
+
+@app.delete("/pdf/{public_id}")
+def delete_pdf(public_id: str):
+    """Delete a PDF from Cloudinary and local storage"""
+    global uploaded_pdfs
+    
+    try:
+        # Find PDF info
+        pdf_info = next((p for p in uploaded_pdfs if p["public_id"] == public_id), None)
+        
+        # Remove from uploaded_pdfs list
+        uploaded_pdfs = [p for p in uploaded_pdfs if p["public_id"] != public_id]
+        
+        # Delete local file if exists
+        if pdf_info and "local_path" in pdf_info and os.path.exists(pdf_info["local_path"]):
+            try:
+                os.remove(pdf_info["local_path"])
+                logger.info(f"Local file deleted: {pdf_info['local_path']}")
+            except Exception as e:
+                logger.error(f"Error deleting local file: {str(e)}")
+        
+        # Also try to delete any loaded version
+        loaded_path = os.path.join(UPLOAD_DIR, f"loaded_{public_id}.pdf")
+        if os.path.exists(loaded_path):
+            try:
+                os.remove(loaded_path)
+                logger.info(f"Loaded file deleted: {loaded_path}")
+            except Exception as e:
+                logger.error(f"Error deleting loaded file: {str(e)}")
+        
+        # Delete from Cloudinary if configured
+        if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+            try:
+                result = cloudinary.uploader.destroy(public_id, resource_type="raw")
+                logger.info(f"Cloudinary delete result: {result}")
+            except Exception as e:
+                logger.error(f"Cloudinary delete error: {str(e)}")
+        
+        return {"status": "ok", "message": "PDF deleted successfully"}
+        
+    except Exception as e:
+        logger.error(f"Delete PDF error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting PDF: {str(e)}")
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
-        # Invoke the graph with language preference
         result = app_graph.invoke({
             "messages": [HumanMessage(content=req.message)],
             "language": req.language
         })
         
-        # Extract the final response
         if result["messages"] and len(result["messages"]) > 0:
             last_message = result["messages"][-1]
             reply = last_message.content if hasattr(last_message, 'content') else str(last_message)
             
-            # Ensure response matches language preference
             if req.language.lower() == "sinhala":
                 if not any('\u0D80' <= char <= '\u0DFF' for char in reply):
                     reply = translate_to_sinhala(reply)
-            else:  # English
+            else:
                 if any('\u0D80' <= char <= '\u0DFF' for char in reply):
                     reply = translate_to_english(reply)
         else:
             reply = "පිළිතුරක් ජනනය කළ නොහැකි වුණා." if req.language.lower() == "sinhala" else "Unable to generate response."
         
         return {"reply": reply}
+        
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         error_msg = f"ඔබගේ ඉල්ලීම සැකසීමේ දෝෂයක්: {str(e)}" if req.language.lower() == "sinhala" else f"Error processing your request: {str(e)}"
